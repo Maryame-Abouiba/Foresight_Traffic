@@ -1,0 +1,15 @@
+# Traffic AI Morocco — Student Demo
+# Install with: pip install -r requirements.txt
+
+ultralytics>=8.0.0       # YOLOv8 (auto-downloads model weights)
+supervision>=0.18.0      # ByteTrack + annotation helpers
+easyocr>=1.7.0           # Plate OCR (Arabic + Latin)
+opencv-python-headless   # Video processing (headless = no GUI dep)
+streamlit>=1.32.0        # Dashboard
+pandas>=2.0.0            # Data handling in dashboard
+numpy>=1.24.0            # Maths
+folium>=0.15.0           # Casablanca violation map
+streamlit-folium>=0.18.0 # Folium integration for Streamlit
+bcrypt>=4.0.0            # Password hashing for auth
+requests>=2.31.0         # OSRM road routing API
+googlemaps>=4.10.0       # Optional Google Maps Directions API
