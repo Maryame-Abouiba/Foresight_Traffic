@@ -43,7 +43,7 @@ except ImportError:
 class CabinConfig:
     MODEL_PATH = "models/best_Distracted_driver.onnx"
     INPUT_SIZE = 640                # YOLOv8 export standard
-    CONF_THRESHOLD = 0.30
+    CONF_THRESHOLD = 0.60
 
     CLASSES = ['Open Eye', 'Closed Eye', 'Cigarette', 'Phone', 'Seatbelt']
 

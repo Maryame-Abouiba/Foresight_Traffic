@@ -27,12 +27,12 @@ with col_form:
     st.subheader("Plan your route")
 
     origin_query = st.text_input(
-        "📍 From (Départ)",
+        "📍 From",
         value="Place Mohammed V",
         placeholder="Type departure place... (e.g. Maarif, Casa Port, Anfa)"
     )
     dest_query = st.text_input(
-        "🏁 To (Arrivée)",
+        "🏁 To",
         value="Twin Center",
         placeholder="Type arrival place... (e.g. Maarif, Sidi Maarouf, Ain Diab)"
     )

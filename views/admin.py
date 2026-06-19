@@ -21,6 +21,8 @@ from db_utils import (
     load_users,
     load_violations,
     setup_database,
+    add_mapped_columns,
+    VIOLATION_DISPLAY_MAP,
 )
 from locations import count_available_videos, list_available_videos
 from ui_styles import page_header
@@ -55,6 +57,43 @@ with tab_users:
     st.subheader("Manage users")
 
     users_df = load_users()
+
+    # Buttons above the user table using st.popover
+    col_btn1, col_btn2, _ = st.columns([1.2, 1.2, 3])
+    
+    with col_btn1:
+        with st.popover("➕ Add user", use_container_width=True):
+            with st.form("admin_create_user_form", clear_on_submit=True):
+                new_user = st.text_input("Username")
+                new_pass = st.text_input("Password", type="password")
+                new_role = st.selectbox("Role", ["user", "admin"])
+                create_btn = st.form_submit_button("Add", use_container_width=True)
+                if create_btn:
+                    ok, msg = create_user_by_admin(new_user, new_pass, new_role)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                        
+    with col_btn2:
+        with st.popover("🗑️ Delete user", use_container_width=True):
+            deletable = users_df["username"].tolist()
+            target = st.selectbox("Select user", deletable, key="delete_user_select")
+            confirm_delete = st.checkbox(
+                f"I confirm I want to delete {target}",
+                key="confirm_delete_user",
+            )
+            if st.button("Delete", type="primary", disabled=not confirm_delete, use_container_width=True):
+                ok, msg = delete_user(target, admin_user["username"])
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.write("") # Spacer
+
     st.dataframe(
         users_df.rename(columns={
             "id": "ID",
@@ -65,56 +104,21 @@ with tab_users:
         hide_index=True,
     )
 
-    st.markdown("#### Delete a user")
-    if len(users_df):
-        deletable = users_df["username"].tolist()
-        target = st.selectbox("Select user to delete", deletable, key="delete_user_select")
-        confirm_delete = st.checkbox(
-            f"I confirm I want to delete **{target}**",
-            key="confirm_delete_user",
-        )
-        if st.button("Delete user", type="primary", disabled=not confirm_delete):
-            ok, msg = delete_user(target, admin_user["username"])
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-    else:
-        st.info("No users found.")
-
-    st.divider()
-    st.markdown("#### Create a user")
-    with st.form("admin_create_user"):
-        new_user = st.text_input("Username")
-        new_pass = st.text_input("Password", type="password")
-        new_role = st.selectbox("Role", ["user", "admin"])
-        create_btn = st.form_submit_button("Create user", use_container_width=True)
-        if create_btn:
-            ok, msg = create_user_by_admin(new_user, new_pass, new_role)
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-
 # ── Violation reports ─────────────────────────────────────────────────────
 with tab_reports:
     st.subheader("Generate violation reports")
 
     all_violations = load_violations()
+    all_violations = add_mapped_columns(all_violations)
 
     col_f1, col_f2, col_f3 = st.columns(3)
     with col_f1:
-        type_opts = (
-            sorted(all_violations["violation_type"].dropna().unique().tolist())
-            if len(all_violations) and "violation_type" in all_violations.columns
-            else ["speeding", "red_light"]
-        )
+        type_opts = ["speeding", "red_light", "phone", "no_seatbelt", "cigarette"]
         sel_types = st.multiselect(
             "Violation type",
             options=type_opts,
             default=type_opts,
+            format_func=lambda x: VIOLATION_DISPLAY_MAP.get(x, x),
         )
     with col_f2:
         loc_opts = (
@@ -131,36 +135,49 @@ with tab_reports:
         )
         sel_vids = st.multiselect("Source video", options=vid_opts, default=vid_opts)
 
-    report_df = filter_violations(
-        all_violations,
-        violation_types=sel_types or None,
-        locations=sel_locs or None,
-        source_videos=sel_vids or None,
-    )
+    report_df = all_violations
+    if sel_types:
+        report_df = report_df[report_df.violation_category.isin(sel_types)]
+    if sel_locs:
+        report_df = report_df[report_df.location_name.isin(sel_locs)]
+    if sel_vids:
+        report_df = report_df[report_df.source_video.isin(sel_vids)]
+
     summary = build_report_summary(report_df)
 
-    r1, r2, r3, r4 = st.columns(4)
+    r1, r2, r3, r4, r5, r6, r7 = st.columns(7)
     r1.metric("Total", summary["total"])
     r2.metric("Speeding", summary["speeding"])
     r3.metric("Red light", summary["red_light"])
-    r4.metric("Avg speed", f"{summary['avg_speed']} km/h")
+    r4.metric("Phone", summary["phone"])
+    r5.metric("Seatbelt", summary["no_seatbelt"])
+    r6.metric("Smoking", summary["cigarette"])
+    r7.metric("Avg Speed", f"{summary['avg_speed']} km/h")
 
     if len(report_df):
         st.markdown("#### Preview")
         preview_cols = [
-            "timestamp", "location_name", "violation_type",
+            "timestamp", "location_name", "violation_display",
             "class_name", "speed_kmh", "plate_text", "source_video",
         ]
         available = [c for c in preview_cols if c in report_df.columns]
         st.dataframe(
-            report_df[available].head(100),
+            report_df[available].rename(columns={
+                "timestamp": "Time",
+                "location_name": "Location",
+                "violation_display": "Type",
+                "class_name": "Vehicle",
+                "speed_kmh": "Speed (km/h)",
+                "plate_text": "Plate",
+                "source_video": "Source Video",
+            }).head(100),
             use_container_width=True,
             hide_index=True,
         )
 
-        if "violation_type" in report_df.columns:
+        if "violation_display" in report_df.columns:
             st.markdown("#### Breakdown by type")
-            st.bar_chart(report_df["violation_type"].value_counts())
+            st.bar_chart(report_df["violation_display"].value_counts())
 
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         export_cols = [

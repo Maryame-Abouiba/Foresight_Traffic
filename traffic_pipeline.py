@@ -35,7 +35,7 @@ from ultralytics import YOLO
 from congestion import CongestionTracker
 from distracted_driver import CabinDistractionDetector
 from plate_anpr import PlateReader
-from db_utils_postgres import get_connection, init_schema, save_violation, ViolationEvent
+from db_utils import get_connection, init_schema, save_violation, ViolationEvent
 
 # ══════════════════════════════════════════════════════════════════════════
 # CONFIG (edit these, no env vars needed)
@@ -408,7 +408,7 @@ class TrafficPipeline:
             color_line = RED if is_red else GREEN
             stop_y = self.violations.stop_line_y()
             cv2.line(frame, (0, stop_y), (self.width, stop_y), color_line, 2)
-            cv2.puttext(frame, "STOP LINE", (10, stop_y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_line, 1)
+            cv2.putText(frame, "STOP LINE", (10, stop_y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_line, 1)
 
             speeds_this_frame: list[float] = []
             violation_track_ids: set[int] = set()

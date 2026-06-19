@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+import pandas as pd
 import psycopg2
 import psycopg2.extras
 
@@ -56,10 +57,24 @@ def init_schema(conn) -> None:
                 created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS frame_stats (
+                id               SERIAL PRIMARY KEY,
+                frame_number     INTEGER,
+                timestamp        TIMESTAMPTZ,
+                vehicle_count    INTEGER,
+                avg_speed_kmh    REAL,
+                congestion_index REAL,
+                source_video     TEXT,
+                video_time_sec   REAL,
+                vehicles_per_minute REAL
+            );
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_violations_type ON violations (violation_type);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_violations_timestamp ON violations (timestamp);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_violations_plate ON violations (plate_text);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_violations_camera ON violations (camera_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_frame_stats_source ON frame_stats (source_video);")
     conn.commit()
     logging.info("PostgreSQL schema ready.")
 
@@ -138,3 +153,64 @@ def save_violation(conn, event: ViolationEvent) -> None:
             ),
         )
     conn.commit()
+
+
+def load_violations(conn) -> pd.DataFrame:
+    """Load all violations from PostgreSQL."""
+    try:
+        df = pd.read_sql("SELECT * FROM violations ORDER BY id DESC", conn)
+        return df
+    except Exception as e:
+        logging.warning("Failed to load violations: %s", e)
+        return pd.DataFrame()
+
+
+def load_frame_stats(conn) -> pd.DataFrame:
+    """Load all frame stats from PostgreSQL."""
+    try:
+        df = pd.read_sql("SELECT * FROM frame_stats ORDER BY frame_number", conn)
+        return df
+    except Exception as e:
+        logging.warning("Failed to load frame stats: %s", e)
+        return pd.DataFrame()
+
+
+VIOLATION_DISPLAY_MAP = {
+    "speeding": "Speeding",
+    "red_light": "Red Light",
+    "phone": "Phone Use",
+    "no_seatbelt": "No Seatbelt",
+    "cigarette": "Smoking",
+}
+
+
+def map_violation_to_category(row) -> str:
+    vt = row.get("violation_type")
+    dl = row.get("distraction_label")
+    if vt == "speeding":
+        return "speeding"
+    elif vt == "red_light":
+        return "red_light"
+    elif vt == "distracted":
+        if dl in ("phone", "no_seatbelt", "cigarette"):
+            return dl
+    return "other"
+
+
+def get_violation_display_name(row) -> str:
+    cat = map_violation_to_category(row)
+    return VIOLATION_DISPLAY_MAP.get(cat, str(row.get("violation_type")).title())
+
+
+def add_mapped_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["violation_category"] = out.apply(map_violation_to_category, axis=1)
+    out["violation_display"] = out["violation_category"].map(VIOLATION_DISPLAY_MAP).fillna(out["violation_type"])
+    return out
+
+
+def setup_database(conn) -> None:
+    """Initialize schema and ensure tables exist."""
+    init_schema(conn)

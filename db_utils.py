@@ -6,7 +6,9 @@ Handles schema migration, auth users, and violation loading with geo data.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import bcrypt
 import pandas as pd
@@ -24,6 +26,48 @@ DEFAULT_USERS = [
     ("admin", "admin123", "admin"),
     ("user", "user123", "user"),
 ]
+
+
+@dataclass
+class ViolationEvent:
+    timestamp: str
+    track_id: int
+    violation_type: str
+    class_name: str
+    confidence: float
+    speed_kmh: Optional[float] = None
+    plate_text: Optional[str] = None
+    bbox: list = field(default_factory=list)
+    frame_number: int = 0
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    location_name: Optional[str] = None
+    camera_id: Optional[str] = None
+    source_video: Optional[str] = None
+    distraction_label: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: str = "image"
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "track_id": self.track_id,
+            "violation_type": self.violation_type,
+            "class_name": self.class_name,
+            "confidence": self.confidence,
+            "speed_kmh": self.speed_kmh,
+            "plate_text": self.plate_text,
+            "bbox": self.bbox,
+            "frame_number": self.frame_number,
+            "lat": self.lat,
+            "lng": self.lng,
+            "location_name": self.location_name,
+            "camera_id": self.camera_id,
+            "source_video": self.source_video,
+            "distraction_label": self.distraction_label,
+            "media_url": self.media_url,
+            "media_type": self.media_type,
+        }
 
 
 def get_connection() -> sqlite3.Connection:
@@ -63,7 +107,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
             lng            REAL,
             location_name  TEXT,
             camera_id      TEXT,
-            source_video   TEXT
+            source_video   TEXT,
+            distraction_label TEXT,
+            media_url      TEXT,
+            media_type     TEXT DEFAULT 'image'
         )
     """)
     conn.execute("""
@@ -103,6 +150,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
         ("violations", "location_name", "TEXT"),
         ("violations", "camera_id", "TEXT"),
         ("violations", "source_video", "TEXT"),
+        ("violations", "distraction_label", "TEXT"),
+        ("violations", "media_url", "TEXT"),
+        ("violations", "media_type", "TEXT"),
         ("frame_stats", "source_video", "TEXT"),
         ("frame_stats", "video_time_sec", "REAL"),
         ("frame_stats", "vehicles_per_minute", "REAL"),
@@ -198,6 +248,41 @@ def sync_frame_stats_sources(conn: sqlite3.Connection) -> None:
         WHERE source_video IS NULL OR source_video = ''
         """,
         (default["video_file"],),
+    )
+    conn.commit()
+
+
+def save_violation(conn, event: ViolationEvent) -> None:
+    """Save a violation event to the database."""
+    import json
+    conn.execute(
+        """
+        INSERT INTO violations
+            (timestamp, track_id, violation_type, distraction_label,
+             class_name, confidence, speed_kmh, bbox, frame_number,
+             plate_text, lat, lng, location_name, camera_id,
+             source_video, media_url, media_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.timestamp,
+            event.track_id,
+            event.violation_type,
+            event.distraction_label,
+            event.class_name,
+            event.confidence,
+            event.speed_kmh,
+            json.dumps(event.bbox) if event.bbox else None,
+            event.frame_number,
+            event.plate_text,
+            event.lat,
+            event.lng,
+            event.location_name,
+            event.camera_id,
+            event.source_video,
+            event.media_url,
+            event.media_type,
+        ),
     )
     conn.commit()
 
@@ -388,19 +473,63 @@ def filter_violations(
     return out
 
 
+VIOLATION_DISPLAY_MAP = {
+    "speeding": "Speeding",
+    "red_light": "Red Light",
+    "phone": "Phone Use",
+    "no_seatbelt": "No Seatbelt",
+    "cigarette": "Smoking",
+}
+
+def map_violation_to_category(row) -> str:
+    vt = row.get("violation_type")
+    dl = row.get("distraction_label")
+    if vt == "speeding":
+        return "speeding"
+    elif vt == "red_light":
+        return "red_light"
+    elif vt == "distracted":
+        if dl in ("phone", "no_seatbelt", "cigarette"):
+            return dl
+    elif vt in ("phone", "no_seatbelt", "cigarette"):
+        return vt
+    return "other"
+
+def get_violation_display_name(row) -> str:
+    cat = map_violation_to_category(row)
+    return VIOLATION_DISPLAY_MAP.get(cat, str(row.get("violation_type")).title())
+
+def add_mapped_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["violation_category"] = out.apply(map_violation_to_category, axis=1)
+    out["violation_display"] = out["violation_category"].map(VIOLATION_DISPLAY_MAP).fillna(out["violation_type"])
+    return out
+
+
 def build_report_summary(df: pd.DataFrame) -> dict:
     if df.empty:
         return {
             "total": 0,
             "speeding": 0,
             "red_light": 0,
+            "phone": 0,
+            "no_seatbelt": 0,
+            "cigarette": 0,
             "avg_speed": 0.0,
             "locations": 0,
             "top_location": "—",
         }
 
-    speeding = int((df["violation_type"] == "speeding").sum()) if "violation_type" in df.columns else 0
-    red_light = int((df["violation_type"] == "red_light").sum()) if "violation_type" in df.columns else 0
+    mapped_df = add_mapped_columns(df)
+    
+    speeding = int((mapped_df["violation_category"] == "speeding").sum()) if "violation_category" in mapped_df.columns else 0
+    red_light = int((mapped_df["violation_category"] == "red_light").sum()) if "violation_category" in mapped_df.columns else 0
+    phone = int((mapped_df["violation_category"] == "phone").sum()) if "violation_category" in mapped_df.columns else 0
+    no_seatbelt = int((mapped_df["violation_category"] == "no_seatbelt").sum()) if "violation_category" in mapped_df.columns else 0
+    cigarette = int((mapped_df["violation_category"] == "cigarette").sum()) if "violation_category" in mapped_df.columns else 0
+    
     avg_speed = float(df["speed_kmh"].dropna().mean()) if "speed_kmh" in df.columns else 0.0
 
     top_location = "—"
@@ -413,6 +542,9 @@ def build_report_summary(df: pd.DataFrame) -> dict:
         "total": len(df),
         "speeding": speeding,
         "red_light": red_light,
+        "phone": phone,
+        "no_seatbelt": no_seatbelt,
+        "cigarette": cigarette,
         "avg_speed": round(avg_speed, 1),
         "locations": loc_count,
         "top_location": top_location,
@@ -422,9 +554,10 @@ def build_report_summary(df: pd.DataFrame) -> dict:
 def build_html_report(df: pd.DataFrame, summary: dict) -> str:
     from datetime import datetime
 
+    mapped_df = add_mapped_columns(df)
     by_type = (
-        df["violation_type"].value_counts().to_frame("Count").to_html()
-        if not df.empty and "violation_type" in df.columns
+        mapped_df["violation_display"].value_counts().to_frame("Count").to_html()
+        if not mapped_df.empty and "violation_display" in mapped_df.columns
         else "<p>No data</p>"
     )
     by_location = (
@@ -449,18 +582,24 @@ def build_html_report(df: pd.DataFrame, summary: dict) -> str:
     table {{ border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }}
     th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
     th {{ background: #f5f5f5; }}
-    .kpi {{ display: inline-block; margin-right: 2rem; }}
+    .kpi-container {{ display: flex; flex-wrap: wrap; margin-bottom: 2rem; gap: 1.5rem; }}
+    .kpi {{ background: #f8f9fa; border: 1px solid #e9ecef; padding: 1rem; border-radius: 8px; min-width: 120px; }}
+    .kpi strong {{ display: block; font-size: 0.9rem; color: #6c757d; text-transform: uppercase; }}
+    .kpi span {{ font-size: 1.5rem; font-weight: bold; color: #212529; }}
   </style>
 </head>
 <body>
   <h1>Traffic AI Morocco — Violation Report</h1>
   <p>Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
-  <div>
-    <div class="kpi"><strong>Total violations:</strong> {summary['total']}</div>
-    <div class="kpi"><strong>Speeding:</strong> {summary['speeding']}</div>
-    <div class="kpi"><strong>Red light:</strong> {summary['red_light']}</div>
-    <div class="kpi"><strong>Avg speed:</strong> {summary['avg_speed']} km/h</div>
-    <div class="kpi"><strong>Top location:</strong> {summary['top_location']}</div>
+  <div class="kpi-container">
+    <div class="kpi"><strong>Total violations</strong><span>{summary['total']}</span></div>
+    <div class="kpi"><strong>Speeding</strong><span>{summary['speeding']}</span></div>
+    <div class="kpi"><strong>Red light</strong><span>{summary['red_light']}</span></div>
+    <div class="kpi"><strong>Phone</strong><span>{summary['phone']}</span></div>
+    <div class="kpi"><strong>No Seatbelt</strong><span>{summary['no_seatbelt']}</span></div>
+    <div class="kpi"><strong>Smoking</strong><span>{summary['cigarette']}</span></div>
+    <div class="kpi"><strong>Avg speed</strong><span>{summary['avg_speed']} km/h</span></div>
+    <div class="kpi"><strong>Top location</strong><span>{summary['top_location']}</span></div>
   </div>
   <h2>By violation type</h2>
   {by_type}

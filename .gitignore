@@ -1,1 +1,9 @@
-".env" 
+env/
+venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+*.db
+*.mp4
+*.avi
+videos/

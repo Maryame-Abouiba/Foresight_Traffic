@@ -13,7 +13,7 @@ streamlit-folium>=0.18.0 # Folium integration for Streamlit
 bcrypt>=4.0.0            # Password hashing for auth
 requests>=2.31.0         # OSRM road routing API
 googlemaps>=4.10.0       # Optional Google Maps Directions API
-"onnxruntime>=1.16.0" 
+onnxruntime>=1.16.0
 
 onnxruntime>=1.16.0
 psycopg2-binary>=2.9.0
