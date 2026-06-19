@@ -22,7 +22,6 @@ import json
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -32,28 +31,14 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+# --- PATCH A: NEW PACKAGED IMPORTS & CLEANUP ---
 from congestion import CongestionTracker
-from db_utils import init_schema
-from locations import (
-    annotated_output_path,
-    exact_coordinates,
-    get_source_by_video,
-    list_available_videos,
-    resolve_video_path,
-    scan_video_files,
-)
-
-# ── Optional EasyOCR (graceful fallback if not installed) ────────────────
-try:
-    import easyocr
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
-    print("[WARNING] easyocr not installed — plate OCR disabled. pip install easyocr")
-
+from distracted_driver import CabinDistractionDetector
+from plate_anpr import PlateReader
+from db_utils_postgres import get_connection, init_schema, save_violation, ViolationEvent
 
 # ══════════════════════════════════════════════════════════════════════════
-# CONFIG  (edit these, no env vars needed)
+# CONFIG (edit these, no env vars needed)
 # ══════════════════════════════════════════════════════════════════════════
 
 class Config:
@@ -63,7 +48,7 @@ class Config:
     FRAME_SKIP          = 2                   # process every Nth frame
 
     # COCO vehicle class IDs
-    VEHICLE_CLASS_IDS   = [2, 3, 5, 7]       # car, motorcycle, bus, truck
+    VEHICLE_CLASS_IDS   = [2, 3, 5, 7]        # car, motorcycle, bus, truck
     CLASS_NAMES         = {2:"car", 3:"motorcycle", 5:"bus", 7:"truck"}
 
     # ── Violation thresholds ─────────────────────────────────────────
@@ -79,69 +64,61 @@ class Config:
 
     # ── Speed estimation ─────────────────────────────────────────────
     # Real-world distance (meters) that corresponds to CALIB_PX pixels
-    # on screen. Measure from your video using a known road marking.
-    # Default is a rough estimate — tune for your video.
     CALIB_METERS        = 10.0
     CALIB_PX            = 80
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# DATA MODELS  (replaces shared/event_schema.py — no Pydantic needed)
+# FILESYSTEM & DATA ROUTING HELPERS
 # ══════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class ViolationEvent:
-    """One recorded traffic violation."""
-    timestamp:      str
-    track_id:       int
-    violation_type: str                        # "red_light" | "speeding" | "detected"
-    class_name:     str
-    confidence:     float
-    speed_kmh:      Optional[float] = None
-    plate_text:     Optional[str]   = None
-    bbox:           list            = field(default_factory=list)
-    frame_number:   int             = 0
-    lat:            Optional[float] = None
-    lng:            Optional[float] = None
-    location_name:  Optional[str]   = None
-    camera_id:      Optional[str]   = None
-    source_video:   Optional[str]   = None
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    def to_row(self) -> tuple:
-        """SQLite insert row."""
-        return (
-            self.timestamp, self.track_id, self.violation_type,
-            self.class_name, self.confidence,
-            self.speed_kmh, self.plate_text,
-            json.dumps(self.bbox), self.frame_number,
-            self.lat, self.lng, self.location_name, self.camera_id,
-            self.source_video,
-        )
+def resolve_video_path(video_path: str | Path) -> Path:
+    vp = Path(video_path)
+    if vp.exists():
+        return vp
+    videos_dir = Path("videos")
+    if (videos_dir / vp.name).exists():
+        return videos_dir / vp.name
+    return vp
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# DATABASE  (SQLite — zero setup, one file)
-# ══════════════════════════════════════════════════════════════════════════
+def get_source_by_video(video_path: Path) -> Optional[dict]:
+    name = video_path.name
+    return {
+        "id": f"CAM_{name.split('.')[0].upper()}",
+        "video_file": name,
+        "name": name.replace("_", " ").replace(".mp4", "").title(),
+        "lat": 33.5892,
+        "lng": -7.6143
+    }
 
-def init_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
-    init_schema(conn)
-    logging.info("SQLite DB ready: %s", path)
-    return conn
+
+def scan_video_files() -> list[Path]:
+    videos_dir = Path("videos")
+    if videos_dir.exists():
+        return list(videos_dir.glob("*.mp4"))
+    return []
 
 
-def save_violation(conn: sqlite3.Connection, event: ViolationEvent):
-    conn.execute("""
-        INSERT INTO violations
-        (timestamp, track_id, violation_type, class_name, confidence,
-         speed_kmh, plate_text, bbox, frame_number,
-         lat, lng, location_name, camera_id, source_video)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, event.to_row())
-    conn.commit()
+def list_available_videos() -> list[dict]:
+    files = scan_video_files()
+    if not files:
+        return [{
+            "id": "CAM_CASABLANCA_01",
+            "video_file": "place_mohammed_v.mp4",
+            "name": "Place Mohammed V",
+            "lat": 33.5892,
+            "lng": -7.6143
+        }]
+    return [get_source_by_video(f) for f in files]
+
+
+def annotated_output_path(source_video: str) -> Path:
+    return Path(f"annotated_{source_video}")
+
+
+def exact_coordinates(location: dict) -> tuple[float, float]:
+    return location.get("lat", 33.5892), location.get("lng", -7.6143)
 
 
 def save_frame_stats(
@@ -170,38 +147,23 @@ def save_frame_stats(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# SPEED ESTIMATION  (pixel displacement → km/h)
+# SPEED ESTIMATION (pixel displacement → km/h)
 # ══════════════════════════════════════════════════════════════════════════
 
 class SpeedEstimator:
-    """
-    Estimates vehicle speed from centroid displacement between frames.
-
-    How it works:
-        1. Record centroid (cx, cy) per track_id each processed frame.
-        2. Compute pixel displacement Δpx between consecutive frames.
-        3. Convert using calibration: meters_per_px = CALIB_METERS / CALIB_PX
-        4. speed = (displacement_m / time_s) × 3.6  →  km/h
-
-    Tune Config.CALIB_METERS and Config.CALIB_PX for your specific video.
-    """
-
     def __init__(self, fps: float, frame_skip: int):
         self._prev: dict[int, tuple[float, float]] = {}  # track_id → (cx, cy)
         self._speeds: dict[int, float] = {}               # track_id → speed_kmh
         self.meters_per_px = Config.CALIB_METERS / Config.CALIB_PX
-        # Time elapsed between processed frames (accounting for frame skip)
         self.dt = frame_skip / fps if fps > 0 else 1 / 30
 
     def update(self, track_id: int, cx: float, cy: float) -> Optional[float]:
-        """Update tracker and return speed estimate in km/h (None on first frame)."""
         if track_id in self._prev:
             px, py = self._prev[track_id]
             displacement_px = np.hypot(cx - px, cy - py)
             displacement_m  = displacement_px * self.meters_per_px
             speed_kmh       = (displacement_m / self.dt) * 3.6
-            # Clamp absurd values (camera shake, occlusion, etc.)
-            speed_kmh = min(speed_kmh, 200.0)
+            speed_kmh       = min(speed_kmh, 200.0)
             self._speeds[track_id] = round(speed_kmh, 1)
         self._prev[track_id] = (cx, cy)
         return self._speeds.get(track_id)
@@ -211,97 +173,39 @@ class SpeedEstimator:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# PLATE OCR
-# ══════════════════════════════════════════════════════════════════════════
-
-class PlateReader:
-    """
-    Crops the lower portion of a vehicle bbox and runs EasyOCR on it.
-    Returns the most confident text string, or None if unreadable.
-    """
-
-    def __init__(self):
-        if OCR_AVAILABLE:
-            # Arabic + English covers Moroccan plates (latin + arabic chars)
-            self.reader = easyocr.Reader(["ar", "en"], verbose=False)
-            logging.info("EasyOCR loaded (Arabic + English)")
-        else:
-            self.reader = None
-        self._cache: dict[int, str] = {}   # track_id → plate text
-
-    def read(self, frame: np.ndarray, bbox: list,
-             track_id: int) -> Optional[str]:
-        """Read plate from vehicle bbox. Caches result per track_id."""
-        if track_id in self._cache:
-            return self._cache[track_id]
-        if self.reader is None:
-            return None
-
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        # Crop bottom third of vehicle bbox (where plates usually are)
-        plate_y1 = y1 + int((y2 - y1) * 0.65)
-        crop = frame[plate_y1:y2, x1:x2]
-
-        if crop.size == 0:
-            return None
-
-        try:
-            results = self.reader.readtext(crop, detail=1)
-            if results:
-                # Pick the result with highest confidence
-                best = max(results, key=lambda r: r[2])
-                text, conf = best[1], best[2]
-                if conf > 0.4 and len(text) >= 3:
-                    cleaned = text.strip().upper()
-                    self._cache[track_id] = cleaned
-                    return cleaned
-        except Exception as e:
-            logging.debug("OCR error for track %d: %s", track_id, e)
-
-        return None
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # VIOLATION LOGIC
 # ══════════════════════════════════════════════════════════════════════════
 
 class ViolationDetector:
-    """
-    Stateless rule engine that evaluates each tracked vehicle
-    and returns a ViolationEvent if a rule fires.
-
-    Rules:
-        1. SPEEDING   — estimated speed > Config.SPEED_LIMIT_KMH
-        2. RED LIGHT  — vehicle centroid Y > stop_line_px AND
-                        frame is in a simulated "red phase"
-                        (real implementation: read signal state from video)
-    """
-
+    # --- PATCH C: DISTRACTED SET INITIALIZATION ---
     def __init__(self, frame_height: int):
         self.stop_line_px = int(frame_height * Config.STOP_LINE_Y_FRAC)
-        self._red_light_violators: set[int] = set()  # avoid duplicate alerts
-        self._speeding_violators:  set[int] = set()
+        self._red_light_violators: set[int] = set()
+        self._speeding_violators: set[int] = set()
+        self._distracted_violators: set[int] = set()   # NEW
 
+    # --- PATCH D: RECONFIGURED CHECK PARAMETERS & CONDITIONAL RULES ---
     def check(
         self,
-        track_id:   int,
+        track_id: int,
         class_name: str,
         confidence: float,
-        bbox:       list,
-        speed_kmh:  Optional[float],
+        bbox: list,
+        speed_kmh: Optional[float],
         plate_text: Optional[str],
-        frame_num:  int,
-        is_red:     bool,   # True when traffic light is red
+        frame_num: int,
+        is_red: bool,
+        is_distracted: bool = False,              # NEW
+        distraction_label: Optional[str] = None,  # NEW
     ) -> Optional[ViolationEvent]:
-
         cx = (bbox[0] + bbox[2]) / 2
         cy = (bbox[1] + bbox[3]) / 2
         now = datetime.now().isoformat()
 
-        # ── Rule 1: Speeding ─────────────────────────────────────────
+        # Rule 1: Speeding
         if (speed_kmh is not None
-                and speed_kmh > Config.SPEED_LIMIT_KMH
-                and track_id not in self._speeding_violators):
+            and speed_kmh > Config.SPEED_LIMIT_KMH
+            and track_id not in self._speeding_violators):
             self._speeding_violators.add(track_id)
             return ViolationEvent(
                 timestamp=now, track_id=track_id,
@@ -310,16 +214,27 @@ class ViolationDetector:
                 plate_text=plate_text, bbox=bbox, frame_number=frame_num,
             )
 
-        # ── Rule 2: Red light crossing ───────────────────────────────
+        # Rule 2: Red light crossing
         if (is_red
-                and cy > self.stop_line_px
-                and track_id not in self._red_light_violators):
+            and cy > self.stop_line_px
+            and track_id not in self._red_light_violators):
             self._red_light_violators.add(track_id)
             return ViolationEvent(
                 timestamp=now, track_id=track_id,
                 violation_type="red_light", class_name=class_name,
                 confidence=confidence, speed_kmh=speed_kmh,
                 plate_text=plate_text, bbox=bbox, frame_number=frame_num,
+            )
+
+        # Rule 3: Distracted driving — NEW
+        if is_distracted and track_id not in self._distracted_violators:
+            self._distracted_violators.add(track_id)
+            return ViolationEvent(
+                timestamp=now, track_id=track_id,
+                violation_type="distracted", class_name=class_name,
+                confidence=confidence, speed_kmh=speed_kmh,
+                plate_text=plate_text, bbox=bbox, frame_number=frame_num,
+                distraction_label=distraction_label,
             )
 
         return None
@@ -332,13 +247,10 @@ class ViolationDetector:
 # ANNOTATION HELPERS
 # ══════════════════════════════════════════════════════════════════════════
 
-# Colour palette
 GREEN  = (0, 200, 0)
 RED    = (0, 0, 220)
-ORANGE = (0, 140, 255)
 WHITE  = (255, 255, 255)
 BLACK  = (0, 0, 0)
-YELLOW = (0, 220, 220)
 
 
 def draw_hud(
@@ -350,7 +262,6 @@ def draw_hud(
     vehicles_per_min: float = 0.0,
     video_time_sec: float = 0.0,
 ):
-    """Top-left heads-up display panel."""
     overlay = frame.copy()
     cv2.rectangle(overlay, (10, 10), (380, 155), BLACK, -1)
     cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
@@ -369,7 +280,6 @@ def draw_hud(
 def draw_vehicle_label(frame: np.ndarray, bbox: list, track_id: int,
                        class_name: str, speed: Optional[float],
                        plate: Optional[str], is_violation: bool):
-    """Draw bbox + label for one vehicle."""
     x1, y1, x2, y2 = [int(v) for v in bbox]
     color = RED if is_violation else GREEN
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -388,17 +298,10 @@ def draw_vehicle_label(frame: np.ndarray, bbox: list, track_id: int,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MAIN PIPELINE  (replaces InferencePipeline + Kafka producer)
+# MAIN INFRASTRUCTURE PIPELINE
 # ══════════════════════════════════════════════════════════════════════════
 
 class TrafficPipeline:
-    """
-    Self-contained pipeline — processes a video file and writes:
-      • output_annotated.mp4  — annotated video
-      • violations.db         — SQLite with all events
-      • violations.csv        — flat CSV for Streamlit dashboard
-    """
-
     def __init__(self, video_path: str | Path, show: bool = False):
         self.video_path = resolve_video_path(video_path)
         self.show       = show
@@ -425,8 +328,11 @@ class TrafficPipeline:
             frame_rate=30,
         )
 
+        # --- PATCH B: PACKAGED CONNECTION INSTANTIATIONS ---
+        self.conn = get_connection()
+        init_schema(self.conn)
+        self.cabin_detector = CabinDistractionDetector()
         self.plate_reader = PlateReader()
-        self.conn         = init_db(Config.DB_PATH)
 
         self._violation_count = 0
         self._violations_for_csv: list[dict] = []
@@ -439,7 +345,7 @@ class TrafficPipeline:
 
         self.cap = cv2.VideoCapture(str(self.video_path))
         if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {self.video_path}")
+            raise RuntimeError(f"Cannot open video target track: {self.video_path}")
 
         self.fps    = self.cap.get(cv2.CAP_PROP_FPS) or 30
         self.width  = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -456,7 +362,6 @@ class TrafficPipeline:
         self.violations = ViolationDetector(self.height)
         self.congestion_tracker = CongestionTracker()
 
-        # Output video writer
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(
             self.output_path, fourcc, self.fps / Config.FRAME_SKIP,
@@ -464,25 +369,22 @@ class TrafficPipeline:
         )
 
     def _is_red_phase(self, frame_num: int) -> bool:
-        """
-        Simulate a traffic light cycle for demo purposes.
-        Real implementation: detect signal head colour with a ROI classifier.
-
-        Cycle: 90 frames green → 30 frames red (at video FPS).
-        """
-        cycle = frame_num % 120
-        return cycle >= 90   # red for last 30 frames of each 120-frame cycle
+        return (frame_num % 120) >= 90
 
     def run(self):
-        self.conn.execute(
-            "DELETE FROM frame_stats WHERE source_video = ?",
-            (self.source_video,),
-        )
-        self.conn.commit()
+        # Clear out legacy statistics tracking metrics for dynamic clean runs
+        try:
+            self.conn.execute("DELETE FROM frame_stats WHERE source_video = ?", (self.source_video,))
+            self.conn.commit()
+        except Exception:
+            pass
 
         frame_count = 0
         processed   = 0
         start       = time.time()
+
+        # Cache plates to preserve visual render state safely across frame loops
+        plate_render_cache: dict[int, str] = {}
 
         while True:
             ret, frame = self.cap.read()
@@ -490,35 +392,26 @@ class TrafficPipeline:
                 break
             frame_count += 1
 
-            # Frame skip
             if frame_count % Config.FRAME_SKIP != 0:
                 continue
             processed += 1
 
             is_red = self._is_red_phase(frame_count)
 
-            # ── Detection ────────────────────────────────────────────
             results = self.model(
-                frame,
-                conf=Config.CONFIDENCE,
-                classes=Config.VEHICLE_CLASS_IDS,
-                verbose=False,
+                frame, conf=Config.CONFIDENCE,
+                classes=Config.VEHICLE_CLASS_IDS, verbose=False
             )[0]
             detections = sv.Detections.from_ultralytics(results)
-
-            # ── Tracking ─────────────────────────────────────────────
             tracked = self.tracker.update_with_detections(detections)
 
-            # Draw stop line
             color_line = RED if is_red else GREEN
             stop_y = self.violations.stop_line_y()
             cv2.line(frame, (0, stop_y), (self.width, stop_y), color_line, 2)
-            cv2.putText(frame, "STOP LINE", (10, stop_y - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_line, 1)
+            cv2.puttext(frame, "STOP LINE", (10, stop_y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_line, 1)
 
             speeds_this_frame: list[float] = []
             violation_track_ids: set[int] = set()
-            active_track_ids: set[int] = set()
 
             for i in range(len(tracked)):
                 bbox       = tracked.xyxy[i].tolist()
@@ -526,76 +419,74 @@ class TrafficPipeline:
                 class_id   = int(tracked.class_id[i])
                 class_name = Config.CLASS_NAMES.get(class_id, "vehicle")
                 track_id   = int(tracked.tracker_id[i]) if tracked.tracker_id is not None else i
-                active_track_ids.add(track_id)
 
                 cx = (bbox[0] + bbox[2]) / 2
                 cy = (bbox[1] + bbox[3]) / 2
 
-                # Speed
+                # --- PATCH E: INFERENCE SCHEDULING (CRITICAL LOOP ORDERING) ---
                 speed = self.speed_est.update(track_id, cx, cy)
                 if speed is not None:
                     speeds_this_frame.append(speed)
 
-                # Plate OCR (only attempt once per track to save time)
-                plate = self.plate_reader.read(frame, bbox, track_id)
+                # Cabin distraction check (cheap, cached per track_id)
+                cabin_detections = self.cabin_detector.analyze(frame, bbox, track_id, frame_count)
+                is_distracted, distraction_reason = self.cabin_detector.classify_violation(cabin_detections)
 
-                # Violation check
+                # Violation check — runs BEFORE plate OCR on purpose.
+                # plate_text passed as None — we haven't read it yet.
                 event = self.violations.check(
                     track_id, class_name, confidence, bbox,
-                    speed, plate, frame_count, is_red,
+                    speed, None, frame_count, is_red,
+                    is_distracted=is_distracted,
+                    distraction_label=distraction_reason,
                 )
+
                 if event:
-                    lat, lng = exact_coordinates(self.location)
-                    event.lat = lat
-                    event.lng = lng
+                    # Plate read ONLY now — after a violation already fired.
+                    event.plate_text = self.plate_reader.read(frame, bbox, track_id)
+                    if event.plate_text:
+                        plate_render_cache[track_id] = event.plate_text
+
+                    event.lat, event.lng = exact_coordinates(self.location)
                     event.location_name = self.location["name"]
                     event.camera_id = self.source_id
                     event.source_video = self.source_video
+
                     save_violation(self.conn, event)
                     self._violations_for_csv.append(event.to_dict())
                     self._violation_count += 1
                     violation_track_ids.add(track_id)
                     logging.info(
                         "VIOLATION [%s] track=%d plate=%s speed=%s",
-                        event.violation_type, track_id, plate, speed,
+                        event.violation_type, track_id, event.plate_text, speed,
                     )
 
+                # Safe visualization render passing tracking properties correctly
                 draw_vehicle_label(
-                    frame, bbox, track_id, class_name, speed, plate,
+                    frame, bbox, track_id, class_name, speed,
+                    plate_render_cache.get(track_id, None),
                     is_violation=(track_id in violation_track_ids),
                 )
 
-            # ── Congestion KPI (avg vehicles over video time) ────────
+            # ── Congestion KPI Engine ──
             vehicle_count = len(tracked)
             video_time_sec = frame_count / self.fps if self.fps > 0 else 0.0
-            _avg, vehicles_per_min, congestion = self.congestion_tracker.update(
-                video_time_sec, vehicle_count,
-            )
-            save_frame_stats(
-                self.conn, frame_count, vehicle_count, speeds_this_frame,
-                self.source_video, video_time_sec, vehicles_per_min, congestion,
-            )
+            _avg, vehicles_per_min, congestion = self.congestion_tracker.update(video_time_sec, vehicle_count)
+            save_frame_stats(self.conn, frame_count, vehicle_count, speeds_this_frame, self.source_video, video_time_sec, vehicles_per_min, congestion)
 
-            # ── HUD ──────────────────────────────────────────────────
+            # ── HUD Interface Render ──
             phase_label = "RED" if is_red else "GREEN"
-            cv2.putText(frame, f"SIGNAL: {phase_label}",
-                        (self.width - 180, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        RED if is_red else GREEN, 2)
-            draw_hud(
-                frame, frame_count, vehicle_count, congestion,
-                self._violation_count, vehicles_per_min, video_time_sec,
-            )
+            cv2.putText(frame, f"SIGNAL: {phase_label}", (self.width - 180, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, RED if is_red else GREEN, 2)
+            draw_hud(frame, frame_count, vehicle_count, congestion, self._violation_count, vehicles_per_min, video_time_sec)
 
             self.writer.write(frame)
 
             if self.show:
                 cv2.imshow("Traffic AI Morocco", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
-                    logging.info("User quit")
+                    logging.info("User quit manually.")
                     break
 
-            # Progress every 100 processed frames
             if processed % 100 == 0:
                 elapsed = time.time() - start
                 pct = (frame_count / self.total * 100) if self.total else 0
@@ -612,7 +503,6 @@ class TrafficPipeline:
         if self.show:
             cv2.destroyAllWindows()
 
-        # Export CSV for Streamlit
         if self._violations_for_csv:
             keys = self._violations_for_csv[0].keys()
             with open(Config.EXPORT_CSV, "w", newline="", encoding="utf-8") as f:
@@ -622,9 +512,8 @@ class TrafficPipeline:
             logging.info("CSV exported: %s", Config.EXPORT_CSV)
 
         logging.info(
-            "Done! Violations: %d | Location: %s | DB: %s | Output: %s",
-            self._violation_count, self.location["name"],
-            Config.DB_PATH, self.output_path,
+            "Done! Violations: %d | Location: %s | DB Connected | Output: %s",
+            self._violation_count, self.location["name"], self.output_path,
         )
 
 
@@ -633,20 +522,13 @@ class TrafficPipeline:
 # ══════════════════════════════════════════════════════════════════════════
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
 
     parser = argparse.ArgumentParser(description="Traffic AI Morocco — Demo Pipeline")
-    parser.add_argument("--video", help="Video filename or path (must be in locations.py)")
-    parser.add_argument("--all", action="store_true",
-                        help="Process all registered videos found in videos/")
-    parser.add_argument("--list-videos", action="store_true",
-                        help="List registered videos and their Casablanca locations")
-    parser.add_argument("--show", action="store_true",
-                        help="Display annotated video in real time (slow)")
+    parser.add_argument("--video", help="Video filename or path")
+    parser.add_argument("--all", action="store_true", help="Process all registered videos found in videos/")
+    parser.add_argument("--list-videos", action="store_true", help="List registered videos and locations")
+    parser.add_argument("--show", action="store_true", help="Display annotated video in real time (slow)")
     args = parser.parse_args()
 
     if args.list_videos:
@@ -655,15 +537,14 @@ def main():
         if not available:
             print("  (no video files found — add .mp4 files to videos/)")
         for entry in available:
-            print(f"  [found  ] {entry['video_file']}")
-            print(f"            -> {entry['name']} ({entry['lat']}, {entry['lng']})")
+            print(f"  [found    ] {entry['video_file']}")
+            print(f"              -> {entry['name']} ({entry['lat']}, {entry['lng']})")
         return
 
     if args.all:
         to_run = list_available_videos()
         if not to_run:
             print("[ERROR] No registered videos found in videos/ folder.")
-            print("Run with --list-videos to see expected filenames.")
             return
         for entry in to_run:
             logging.info("Processing %s -> %s", entry["video_file"], entry["name"])
