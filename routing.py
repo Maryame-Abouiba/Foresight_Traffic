@@ -23,12 +23,18 @@ from locations import (
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 CONGESTION_RADIUS_KM = 0.35
 
+# Both the "Avoid congestion" slider and each zone's congestion index are
+# on the same 0-100 scale. A zone becomes a hard constraint (must be
+# avoided entirely) when the user's slider value is at or above that
+# zone's own congestion index; below it, the zone is only a soft
+# preference in the duration/congestion scoring.
+
 
 def search_casablanca_place(query: str) -> list[dict]:
     """Search for locations in Casablanca using Nominatim OpenStreetMap API."""
     if not query or not query.strip():
         return []
-    
+
     # Biasing query to Casablanca, Morocco
     full_query = f"{query.strip()}, Casablanca, Morocco"
     headers = {
@@ -45,7 +51,7 @@ def search_casablanca_place(query: str) -> list[dict]:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         results = resp.json()
-        
+
         places = []
         for r in results:
             # Casablanca coordinates boundary check
@@ -58,7 +64,7 @@ def search_casablanca_place(query: str) -> list[dict]:
                 parts = [p.strip() for p in raw_name.split(",")]
                 name = parts[0] if parts else "Location"
                 display_name = ", ".join(parts[:4])
-                
+
                 places.append({
                     "name": name,
                     "display_name": display_name,
@@ -77,6 +83,24 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     dlambda = math.radians(lng2 - lng1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
+
+
+def _offset_point(lat: float, lng: float, bearing_deg: float, distance_km: float) -> tuple[float, float]:
+    """Move a point a given distance in a given bearing direction (spherical formula)."""
+    r = 6371.0
+    bearing = math.radians(bearing_deg)
+    lat1 = math.radians(lat)
+    lng1 = math.radians(lng)
+    d_r = distance_km / r
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(d_r) + math.cos(lat1) * math.sin(d_r) * math.cos(bearing)
+    )
+    lng2 = lng1 + math.atan2(
+        math.sin(bearing) * math.sin(d_r) * math.cos(lat1),
+        math.cos(d_r) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lat2), math.degrees(lng2)
 
 
 def load_zone_congestion() -> dict[str, float]:
@@ -134,6 +158,148 @@ def _fetch_osrm_routes(
     if data.get("code") != "Ok" or not data.get("routes"):
         raise RuntimeError(data.get("message", "Could not find a route."))
     return data["routes"]
+
+
+def _route_avoids_zones(
+    geometry: list[list[float]],
+    zones: list[dict],
+    radius_km: float = CONGESTION_RADIUS_KM,
+) -> bool:
+    """True if the route never comes within radius_km of any of the given zones."""
+    if not geometry:
+        return False
+    step = max(1, len(geometry) // 60)
+    for i in range(0, len(geometry), step):
+        lat, lng = geometry[i]
+        for zone in zones:
+            zlat, zlng = exact_coordinates(zone)
+            if haversine_km(lat, lng, zlat, zlng) <= radius_km:
+                return False
+    return True
+
+
+def _fetch_detour_route(
+    origin_lat: float,
+    origin_lng: float,
+    dest_lat: float,
+    dest_lng: float,
+    avoid_zones: list[dict],
+    require_clear: bool = False,
+) -> dict | None:
+    """Build a route through an offset waypoint to steer around congested zones.
+
+    Used as a fallback when OSRM's public server does not return a genuine
+    alternative route (a common limitation on short/medium urban trips).
+
+    Tries increasing offset distances, on both sides of the direct bearing,
+    and checks whether each candidate actually clears the congestion radius
+    around the zones being avoided (OSRM can otherwise snap the waypoint
+    back onto a road inside that radius, common near dense/constrained
+    areas like a port, producing a route that loops right past the zone
+    instead of avoiding it).
+
+    require_clear=False (soft mode): returns the first candidate that
+    clears the zones, or — if none does — the best-effort candidate found,
+    so it can still be scored against the direct route.
+
+    require_clear=True (hard mode): the zone must genuinely be avoided, so
+    the offsets tried go further, and None is returned if no candidate
+    manages to clear the zones (the caller must then decide how to handle
+    that, rather than silently returning a route that still crosses it).
+    """
+    if not avoid_zones:
+        return None
+
+    # Average position of the zones to avoid
+    avg_lat = sum(exact_coordinates(z)[0] for z in avoid_zones) / len(avoid_zones)
+    avg_lng = sum(exact_coordinates(z)[1] for z in avoid_zones) / len(avoid_zones)
+
+    # General direction of the trip
+    bearing_to_dest = math.degrees(
+        math.atan2(dest_lng - origin_lng, dest_lat - origin_lat)
+    )
+
+    if require_clear:
+        # Hard constraint: allow much larger detours before giving up.
+        offsets_km = [f * CONGESTION_RADIUS_KM for f in (1.5, 2.5, 4.0, 6.0, 9.0, 13.0, 18.0)]
+    else:
+        offsets_km = [f * CONGESTION_RADIUS_KM for f in (1.5, 2.5, 4.0, 6.0)]
+
+    fallback_route = None  # best route found even if it doesn't fully clear
+
+    for offset_km in offsets_km:
+        for perpendicular_offset in (90, -90):
+            bearing = (bearing_to_dest + perpendicular_offset) % 360
+            wp_lat, wp_lng = _offset_point(avg_lat, avg_lng, bearing, offset_km)
+
+            coord_str = f"{origin_lng},{origin_lat};{wp_lng},{wp_lat};{dest_lng},{dest_lat}"
+            try:
+                resp = requests.get(
+                    f"{OSRM_URL}/{coord_str}",
+                    params={
+                        "overview": "full",
+                        "geometries": "geojson",
+                        "alternatives": "false",
+                        "steps": "false",
+                    },
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") != "Ok" or not data.get("routes"):
+                    continue
+                candidate = _normalize_route(data["routes"][0])
+            except Exception:
+                continue
+
+            if fallback_route is None or candidate["duration_min"] < fallback_route["duration_min"]:
+                fallback_route = candidate
+
+            if _route_avoids_zones(candidate["geometry"], avoid_zones):
+                # First candidate that genuinely clears the zone: keep the
+                # smallest offset that works, to avoid unnecessarily long detours.
+                return candidate
+
+    if require_clear:
+        # No offset managed to fully clear the zone (e.g. a peninsula-like
+        # port road network with no viable bypass). Let the caller decide;
+        # do not silently pretend a non-clearing route satisfies the
+        # hard constraint.
+        return None
+
+    # Soft mode: no offset fully cleared the zone, return the closest
+    # attempt rather than nothing, the scoring step will still penalize
+    # it correctly against the direct route.
+    return fallback_route
+
+
+def _zones_on_direct_path(
+    direct_geometry: list[list[float]],
+    congestion: dict[str, float],
+) -> list[tuple[dict, float]]:
+    """Return (zone, congestion_value) pairs for every zone with congestion > 0
+    that actually lies on the direct route. Filtering by sensitivity happens
+    in the caller, since the same zone can be a hard constraint for one
+    trip and a soft preference for another depending on the slider value.
+    """
+    zones_by_id = get_active_zones_by_id()
+    hits: list[tuple[dict, float]] = []
+    if not direct_geometry:
+        return hits
+    step = max(1, len(direct_geometry) // 40)
+    for zid, cong in congestion.items():
+        if cong <= 0:
+            continue
+        zone = zones_by_id.get(zid)
+        if not zone:
+            continue
+        zlat, zlng = exact_coordinates(zone)
+        for i in range(0, len(direct_geometry), step):
+            lat, lng = direct_geometry[i]
+            if haversine_km(lat, lng, zlat, zlng) <= CONGESTION_RADIUS_KM:
+                hits.append((zone, cong))
+                break
+    return hits
 
 
 def _route_congestion_score(
@@ -242,19 +408,49 @@ def plan_routes(
     candidates = [_normalize_route(r) for r in raw_routes]
     direct = min(candidates, key=lambda r: r["duration_min"])
 
-    if len(candidates) > 1:
-        # Score candidates. We add a 30-minute penalty if the candidate route passes near an active video camera.
-        scored = sorted(
-            candidates,
-            key=lambda r: (
-                r["duration_min"]
-                + _route_congestion_score(r["geometry"], congestion, sensitivity) * 15
-                + (30.0 if _route_passes_active_video(r["geometry"], active_zones, o_lat, o_lng, d_lat, d_lng) else 0.0)
-            ),
-        )
-        recommended = scored[0]
-    else:
-        recommended = direct
+    # Zones the direct route actually passes through, each with its own
+    # congestion index (0-100), on the same scale as the "Avoid congestion"
+    # slider (sensitivity). Compare the two per zone:
+    #   sensitivity >= zone congestion  -> hard constraint, must be avoided
+    #   sensitivity <  zone congestion  -> soft preference, only scored
+    zones_on_path = _zones_on_direct_path(direct["geometry"], congestion)
+    hard_zones = [zone for zone, cong in zones_on_path if sensitivity >= cong]
+    soft_zones = [zone for zone, cong in zones_on_path if sensitivity < cong]
+
+    recommended = None
+
+    if hard_zones:
+        forced = _fetch_detour_route(o_lat, o_lng, d_lat, d_lng, hard_zones, require_clear=True)
+        if forced is not None:
+            recommended = forced
+        else:
+            # No offset could fully clear the hard-constraint zone(s)
+            # (e.g. a port peninsula with no real bypass). Fall back to the
+            # best-effort detour and let the scoring below pick between it
+            # and the direct route, rather than pretending it is clear.
+            best_effort = _fetch_detour_route(o_lat, o_lng, d_lat, d_lng, hard_zones, require_clear=False)
+            if best_effort is not None:
+                candidates.append(best_effort)
+
+    if recommended is None and soft_zones:
+        detour = _fetch_detour_route(o_lat, o_lng, d_lat, d_lng, soft_zones, require_clear=False)
+        if detour is not None:
+            candidates.append(detour)
+
+    if recommended is None:
+        if len(candidates) > 1:
+            # Score candidates. We add a 30-minute penalty if the candidate route passes near an active video camera.
+            scored = sorted(
+                candidates,
+                key=lambda r: (
+                    r["duration_min"]
+                    + _route_congestion_score(r["geometry"], congestion, sensitivity) * 15
+                    + (30.0 if _route_passes_active_video(r["geometry"], active_zones, o_lat, o_lng, d_lat, d_lng) else 0.0)
+                ),
+            )
+            recommended = scored[0]
+        else:
+            recommended = direct
 
     direct_cong = _route_congestion_score(direct["geometry"], congestion, 100.0)
     alt_cong = _route_congestion_score(recommended["geometry"], congestion, 100.0)

@@ -28,20 +28,19 @@ if not st.session_state.get("authenticated"):
 user = st.session_state.user
 
 pages = {
-    "Operations": [
-        st.Page("views/monitoring.py", title="Monitoring", icon=":material/videocam:", default=True),
-        st.Page("views/optimization.py", title="Route Optimization", icon=":material/route:"),
+    "Driver": [
+        st.Page("views/optimization.py", title="Route Optimization & Congestion", icon=":material/alt_route:", default=True),
     ],
 }
 
 if is_admin(user):
     pages["Administration"] = [
-        st.Page("views/admin.py", title="Admin Dashboard", icon=":material/admin_panel_settings:"),
+        st.Page("views/admin.py", title="System Administration", icon=":material/admin_panel_settings:"),
     ]
 
 with st.sidebar:
-    st.markdown("### Traffic AI Morocco")
-    st.caption("Casablanca traffic intelligence")
+    st.markdown("### Smart Drive Morocco 🚘")
+    st.caption("Driver Assistant & Traffic Optimization")
     st.markdown("---")
     st.caption(f"**{user['username']}** · {user['role']}")
     if st.button("Sign out", use_container_width=True, type="secondary"):
