@@ -12,7 +12,7 @@ from auth import auth_page, init_session, is_admin
 from ui_styles import inject_global_styles
 
 st.set_page_config(
-    page_title="Traffic AI Morocco",
+    page_title="Foresight Traffic",
     page_icon="🚦",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -39,7 +39,7 @@ if is_admin(user):
     ]
 
 with st.sidebar:
-    st.markdown("### Smart Drive Morocco 🚘")
+    st.markdown("### Foresight Traffic 🚘")
     st.caption("Driver Assistant & Traffic Optimization")
     st.markdown("---")
     st.caption(f"**{user['username']}** · {user['role']}")

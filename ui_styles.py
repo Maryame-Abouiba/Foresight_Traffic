@@ -1,4 +1,4 @@
-"""Shared Streamlit UI styling for Traffic AI Morocco."""
+"""Shared Streamlit UI styling for Foresight Traffic."""
 
 import streamlit as st
 

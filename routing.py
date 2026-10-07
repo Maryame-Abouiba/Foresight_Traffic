@@ -38,7 +38,7 @@ def search_casablanca_place(query: str) -> list[dict]:
     # Biasing query to Casablanca, Morocco
     full_query = f"{query.strip()}, Casablanca, Morocco"
     headers = {
-        "User-Agent": "TrafficAIMorocco/1.0 (contact@trafficaimorocco.ma)"
+        "User-Agent": "ForesightTraffic/1.0 (contact@foresighttraffic.ma)"
     }
     url = "https://nominatim.openstreetmap.org/search"
     params = {

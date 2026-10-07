@@ -1,8 +1,5 @@
 """
-Video-to-location registry for Traffic AI Morocco.
-
-Coordinates are WGS84 (lat, lng) from OpenStreetMap / Wikipedia.
-Edit lat/lng here to match the exact camera position on the map.
+Video-to-location registry for Foresight Traffic.
 """
 
 from __future__ import annotations

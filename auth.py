@@ -69,7 +69,7 @@ def auth_page() -> None:
         st.markdown(
             """
             <div class="login-box">
-                <h1>Traffic AI Morocco</h1>
+                <h1>Foresight Traffic</h1>
                 <p>Casablanca Traffic Intelligence & Route Optimization</p>
             </div>
             """,
