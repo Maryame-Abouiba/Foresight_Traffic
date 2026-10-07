@@ -1,4 +1,7 @@
+"""Replay each traffic video through the application's own CongestionTracker."""
 import json
+import os
+import sys
 from pathlib import Path
 
 import cv2
@@ -6,29 +9,34 @@ import pandas as pd
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[1]
-VIDEO_DIR = ROOT / "videos"
+sys.path.insert(0, str(ROOT))
+os.chdir(ROOT)                     # locations.py uses the relative path "videos"
+
+from congestion import CongestionTracker
+from locations import scan_video_files, get_source_by_video
+
 OUT_DIR = ROOT / "data" / "congestion"
 WEIGHTS = ROOT / "yolov8n.pt"
-
-VEHICLE_CLASSES = [2, 3, 5, 7]   # car, motorcycle, bus, truck (COCO)
-CONF = 0.35
-WINDOW_S = 15
-MAX_SECONDS = None               # for example 600 to limit very long videos
+VEHICLE_CLASSES = [2, 3, 5, 7]     # COCO: car, motorcycle, bus, truck
+CONF = 0.35                        # TO CHECK against the application's counting code
 
 
-def count_per_second(video, model):
+def run_video(video, model):
     cap = cv2.VideoCapture(str(video))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     step = max(1, int(round(fps)))
+    tracker = CongestionTracker()
     rows, i = [], 0
     while cap.grab():
         if i % step == 0:
             ok, frame = cap.retrieve()
             if ok:
+                t = i / fps
                 r = model.predict(frame, conf=CONF, classes=VEHICLE_CLASSES, verbose=False)[0]
-                rows.append({"t_sec": round(i / fps, 2), "count": len(r.boxes)})
-                if MAX_SECONDS and len(rows) >= MAX_SECONDS:
-                    break
+                count = len(r.boxes)
+                avg, vpm, idx = tracker.update(t, count)
+                rows.append({"t_sec": round(t, 2), "count": count, "avg_density": avg,
+                             "vehicles_per_min": vpm, "congestion_index": idx})
         i += 1
     cap.release()
     return pd.DataFrame(rows)
@@ -38,18 +46,23 @@ if __name__ == "__main__":
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     model = YOLO(str(WEIGHTS))
     reference = {}
-    videos = sorted(p for p in VIDEO_DIR.iterdir() if p.suffix.lower() in {".mp4", ".avi"})
-    for video in videos:
-        df = count_per_second(video, model)
+    for path in scan_video_files():
+        src = get_source_by_video(path.name)
+        zone = src["id"]
+        df = run_video(path, model)
         if df.empty:
-            print(video.stem, "| no frame read, skipped")
+            print(zone, "| no frame read, skipped")
             continue
-        peak = int(df["count"].max())
-        df["avg_density"] = df["count"].rolling(WINDOW_S, min_periods=1).mean()
-        df["congestion_index"] = (df["avg_density"] / peak * 100).clip(upper=100) if peak else 0.0
-        df.to_csv(OUT_DIR / f"density_{video.stem}.csv", index=False)
-        mean_idx = round(float(df["congestion_index"].mean()), 1)
-        reference[video.stem] = {"mean_index": mean_idx, "peak_count": peak,
-                                 "duration_s": int(df["t_sec"].max())}
-        print(f"{video.stem} | peak: {peak} vehicles | mean index: {mean_idx} | {len(df)} s analyzed")
+        df.to_csv(OUT_DIR / f"density_{zone}.csv", index=False)
+        reference[zone] = {
+            "name": src["name"], "video": path.name,
+            "last_index": float(df["congestion_index"].iloc[-1]),
+            "mean_index": round(float(df["congestion_index"].mean()), 1),
+            "max_index": float(df["congestion_index"].max()),
+            "peak_count": int(df["count"].max()),
+            "duration_s": int(df["t_sec"].max()),
+        }
+        r = reference[zone]
+        print(f"{zone} ({r['name']}) | last: {r['last_index']} | mean: {r['mean_index']} | "
+              f"max: {r['max_index']} | peak count: {r['peak_count']} | {len(df)} s analyzed")
     (OUT_DIR / "reference.json").write_text(json.dumps(reference, indent=2), encoding="utf-8")
