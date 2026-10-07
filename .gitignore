@@ -7,3 +7,9 @@ __pycache__/
 *.mp4
 *.avi
 videos/
+__pycache__/
+*.pyc
+env/
+.env
+.streamlit/secrets.toml
+*.db
