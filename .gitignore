@@ -12,3 +12,10 @@ videos/
 data/
 runs/
 models/*.pt
+
+*.pt
+*.pth
+*.joblib
+data/accidents/
+data/history/*.csv
+runs/
