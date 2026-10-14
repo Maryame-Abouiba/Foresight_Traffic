@@ -19,3 +19,7 @@ models/*.pt
 data/accidents/
 data/history/*.csv
 runs/
+
+*.weights
+*.onnx
+*.cfg
